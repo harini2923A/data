@@ -142,12 +142,37 @@ def prepare_data(organizations, states, countries, country):
         countries_country_id = get_column(
             countries, ["country_id"], "country ID"
         )
-        country_code = get_column(
-            countries, ["country_code"], "country code"
+        country_code = next(
+            (
+                column
+                for column in countries.columns
+                if column.lower() == "country_code"
+            ),
+            None,
+        )
+        country_name = next(
+            (
+                column
+                for column in countries.columns
+                if column.lower() == "country_name"
+            ),
+            None,
         )
 
+        if country_code is None and country_name is None:
+            raise ValueError(
+                "countries.csv must contain country_code or country_name."
+            )
+
         state_map = states[[states_state_id, states_country_id]].copy()
-        country_map = countries[[countries_country_id, country_code]].copy()
+
+        country_fields = [countries_country_id]
+        if country_code is not None:
+            country_fields.append(country_code)
+        if country_name is not None:
+            country_fields.append(country_name)
+
+        country_map = countries[country_fields].copy()
 
         joined = organizations.merge(
             state_map,
@@ -162,11 +187,21 @@ def prepare_data(organizations, states, countries, country):
             how="left",
         )
 
-        joined = joined[
-            joined[country_code].astype("string").str.upper()
-            == country.strip().upper()
-        ]
-        organizations = joined
+        target_country = country.strip().casefold()
+        country_matches = pd.Series(False, index=joined.index)
+
+        for column in (country_code, country_name):
+            if column is not None:
+                country_matches = country_matches | (
+                    joined[column]
+                    .astype("string")
+                    .str.strip()
+                    .str.casefold()
+                    .eq(target_country)
+                )
+
+        organizations = joined[country_matches]
+
 
     return organizations
 
@@ -226,34 +261,57 @@ def build_rating_distribution(data):
 
 
 def build_organization_mix_trend(data, start_date, end_date, monthly=False):
-    """Build sparse cumulative totals separately for each organization type."""
-    data = filter_dates(data, start_date, end_date)
-
-    if monthly:
-        data["_period"] = pd.to_datetime(
-            data["_created"].astype(str)
-        ).dt.strftime("%Y-%m")
-    else:
-        data["_period"] = data["_created"].apply(lambda value: value.isoformat())
-
+    """Return sparse period entries with all-time cumulative totals."""
     result = {"non_profit": [], "for_profit": []}
 
-    for organization_type in ("non_profit", "for_profit"):
-        type_data = data[data["_type"] == organization_type]
+    if data.empty:
+        return result
 
-        if type_data.empty:
+    # Keep all records for cumulative totals, but only display periods
+    # that contain organizations inside the requested date range.
+    all_data = data.copy()
+    window_data = filter_dates(data, start_date, end_date)
+
+    if window_data.empty:
+        return result
+
+    for frame in (all_data, window_data):
+        if monthly:
+            frame["_period"] = pd.to_datetime(
+                frame["_created"].astype(str)
+            ).dt.strftime("%Y-%m")
+        else:
+            frame["_period"] = frame["_created"].apply(
+                lambda value: value.isoformat()
+            )
+
+    for organization_type in ("non_profit", "for_profit"):
+        all_type_data = all_data[
+            all_data["_type"] == organization_type
+        ]
+        window_type_data = window_data[
+            window_data["_type"] == organization_type
+        ]
+
+        if window_type_data.empty:
             continue
 
-        counts = type_data.groupby("_period").size().sort_index()
+        visible_periods = set(window_type_data["_period"])
+
+        counts = (
+            all_type_data.groupby("_period")
+            .size()
+            .sort_index()
+        )
         cumulative = counts.cumsum()
 
         result[organization_type] = [
-            {"date": str(period), "count": int(total)}
+            {"period": str(period), "count": int(total)}
             for period, total in cumulative.items()
+            if period in visible_periods
         ]
 
     return result
-
 
 def build_bucket(data, start_date, end_date, monthly=False):
     """Build both charts for a standard date range."""
@@ -282,7 +340,13 @@ def build_response(params, organizations, states, countries):
 
     # If either custom date pair is supplied, return only Custom.
     if rating_dates is not None or type_dates is not None:
-        custom = {}
+        custom = {
+            "rating_distribution": [],
+            "organization_mix_trend": {
+                "non_profit": [],
+                "for_profit": [],
+            },
+        }
 
         if rating_dates is not None:
             start_date, end_date = rating_dates
@@ -299,6 +363,7 @@ def build_response(params, organizations, states, countries):
 
         return {"Custom": custom}
 
+
     seven_day_start = today - timedelta(days=6)
     thirty_day_start = today - timedelta(days=29)
     year_start = today - timedelta(days=364)
@@ -313,7 +378,13 @@ def build_response(params, organizations, states, countries):
             today,
             monthly=True,
         ),
-        "Custom": {},
+        "Custom": {
+            "rating_distribution": [],
+            "organization_mix_trend": {
+                "non_profit": [],
+                "for_profit": [],
+            },
+        },
     }
 
 
